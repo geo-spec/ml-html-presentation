@@ -1,0 +1,1460 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Прогнозирование спроса · CatBoost · Курсовая ML</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="deck-stage.js"></script>
+
+<script type="application/json" id="speaker-notes">
+[
+  "Добрый день. Меня зовут Шилин Георгий, тема моей курсовой работы — прогнозирование спроса на автоматах быстрого питания с помощью CatBoost. Коротко о главном результате: удалось получить на тесте MAE ноль целых пятьсот девяносто семь единиц товара в день, это на шестнадцать целых две десятых процента лучше самого сильного простого бейзлайна. Дальше я пройдусь по бизнес-задаче, постановке в терминах ML, данным, фичам, моделям и ошибкам.",
+
+  "Начну с бизнес-контекста. Автомат работает в ежедневном цикле загрузки — и здесь возникает классический trade-off. Если загрузить слишком много — часть товара истечёт по сроку годности и будет списана, в исторических данных доля списаний колеблется от одиннадцати до двадцати одного процента. Если загрузить слишком мало — автомат стоит пустой, и это прямая потерянная выручка. Прогноз спроса — не конечная цель, а вход в решение о том, сколько и чего заправить. Моя работа покрывает именно шаг прогноза.",
+
+  "В терминах ML это задача регрессии. Таргет — total qty, штуки, проданные за день. Гранулярность — тройка: автомат, товар, день. Горизонт прогноза — один день вперёд, то есть на следующую заправку. Основная метрика — MAE, потому что ошибка в штуках напрямую интерпретируется в деньги и списания, а MAE устойчива к редким выбросам в продажах.",
+
+  "Датасет собран из продакшен-базы. Три миллиона четыреста шестьдесят тысяч строк, триста двадцать один автомат, восемьсот девяносто уникальных товаров. Split строго временной, никаких случайных перемешиваний: train — с января двадцать четвёртого по август двадцать пятого, валидация — сентябрь–ноябрь двадцать пятого, тест — декабрь двадцать пятого и январь двадцать шестого. Это имитирует реальный деплой: учимся на прошлом, проверяемся на будущем.",
+
+  "На этом слайде показываю таймлайн всего датасета. Здесь видно, что temporal split сделан по реальной хронологии, а не случайно. Одновременно заметен офисный паттерн: будние пики и провалы на выходных проходят через весь период. Это полезная проверка на разумность: в данных есть устойчивая сезонность, которую модель действительно может учить.",
+
+  "Коротко про распределение. Медиана дневных продаж — одна штука, девяносто пятый перцентиль — четыре штуки. Типичный профиль — офисный: всплеск утром и в обед, провал на выходных. Важное ограничение — censored demand: если товар закончился в автомате, мы видим ноль продаж, но это не ноль спроса. Эта цензура — главный источник систематической ошибки в сторону занижения, к ней ещё вернусь в выводах.",
+
+  "Работа с данными началась не с модели, а с расследования. Сырые данные смешивали реальный спрос, тестовые операции и технический шум. Дедупликация затронула сто шестьдесят одну тысячу продаж и семьсот три тысячи stock-записей. Пришлось убрать тестовые точки, короткоживущие локации, проблемные периоды. Но главный вывод оказался глубже: ноль продаж не всегда означает ноль спроса — иногда товар просто отсутствовал.",
+
+  "Я не остановился на механической чистке — проверял, что реально влияет на модель. Actual Menu был красивой гипотезой, но в чистом виде не стал главным источником роста. Зато сработала идея availability: если товар отсутствовал, ноль продаж нельзя считать нулевым спросом. Когда этот сигнал добавляется аккуратно, с guard по качеству load evidence, модель видит ситуацию ближе к реальности — это дало около двух процентов снижения Test MAE.",
+
+  "Пайплайн обработки: PostgreSQL, очистка, parquet, фичи, модель. Применяется девять фильтров — от невалидных дат до аномальных цен. Дедуплицировано сто шестьдесят одна тысяча записей продаж и семьсот три тысячи записей остатков — это критично, потому что двойной учёт одной продажи сразу ломает таргет.",
+
+  "Фич-инжиниринг — двадцать три признака в шести группах: категориальные — автомат и товар, календарные — день недели, месяц, праздники, лаги — продажи вчера и на прошлой неделе, скользящие средние за семь и тридцать дней, остатки и цены со скидками. Ключевой момент — защита от лика. Все лаги и скользящие считаются через shift на один день, то есть на момент предсказания никакой информации о сегодняшнем дне в фичах нет.",
+
+  "Бейзлайны — чтобы понимать, с чем вообще сравниваемся. Global Mean даёт MAE ноль восемьдесят восемь. Group Mean по паре автомат-товар — ноль семьдесят пять. Lag один день — ноль семьдесят восемь. Rolling Mean за семь дней — 0.658. То есть простое скользящее среднее за неделю — уже сильный бейзлайн, именно с ним я и сравниваю основную модель.",
+
+  "Здесь отдельно показываю Optuna. Было проведено пятьдесят три trial'а по depth, learning rate, L2 и subsample. Лучший Val MAE — 0.5623. Но для меня важна не только сама цифра, а форма графика: локальный тюнинг помогает, но уже не переворачивает качество задачи радикально. То есть Optuna здесь полезен как проверка на разумность по области параметров, а не как источник финального решающего прироста.",
+
+  "Основная модель — CatBoost. На графике справа — прогноз против факта на тестовой выборке. По качеству это лучший результат в моём едином сравнении: MAE на валидации — 0.549, MAE на тесте — 0.597. Это на шестнадцать целых две десятых процента лучше Rolling Mean 7d. Почему именно CatBoost: он нативно работает с категориальными признаками высокой кардинальности и при этом остаётся удобным для интерпретации через importance и SHAP.",
+
+  "Про переобучение. Train MAE — 0.492, Val MAE — 0.549, разрыв — 10.4%. Early stopping остановил обучение примерно на девятьсот тридцать третьем дереве. Разрыв умеренный, регуляризации через early stopping и L2 достаточно, дальнейшая борьба с переобучением требует больше данных, а не тюнинга.",
+
+  "Feature importance. Доминирует rolling-история: суммарно около сорока девяти процентов. Топ-фича — rolling mean за тридцать дней. Это ожидаемо: самый сильный сигнал о том, сколько товара продастся завтра, — сколько его продавалось последние недели. Цена и скидки дают вторичный контекст, календарь и категориальные — около десяти процентов каждая. SHAP-анализ это подтверждает.",
+
+  "На этом сравнении важно смотреть на общий рисунок. Все три бустинга заметно лучше baseline, а нейросети на табличных данных уступают. При этом CatBoost здесь уже не просто удобная основная модель, а формальный лидер сравнения: 0.549 на валидации и 0.597 на тесте. Поэтому выбор CatBoost опирается и на качество, и на нативную работу с категориальными признаками, и на удобную интерпретацию.",
+
+  "Итоговые выводы. Test MAE — 0.597 штуки в день, это на шестнадцать целых две десятых процента лучше Rolling Mean 7d. В прикладном смысле модель в среднем ошибается меньше чем на одну штуку товара на точку прогноза — для задачи загрузки это уже рабочий уровень. Главный оставшийся источник ошибки — цензурированный спрос: ноль продаж не всегда означает нулевой спрос, иногда товар просто закончился. Следующий логический шаг — прогноз спроса с учётом доступности товара.",
+
+  "Ошибка модели связана не только с алгоритмом, но и с постановкой данных: если товар закончился, продажи низкие, но спрос мог быть высоким. Признаки доступности товара помогают отделить реальный низкий спрос от пустой полки. Три конкретных шага: первый — добавить признаки доступности из снимков остатков, второй — обучаться только на днях с подтверждённой доступностью товара, третий — перейти от прогноза спроса к оптимизации загрузки, минимизируя и списания, и потерянные продажи. Спасибо, готов к вопросам."
+]
+</script>
+
+<style>
+/* ─── Design tokens ─────────────────────────────────────────────── */
+:root {
+  --bg: #FAFAFA;
+  --ink: #111111;
+  --ink-2: #3A3A3C;
+  --ink-3: #6E6E73;
+  --ink-4: #A1A1A6;
+  --rule: #D6D6D9;
+  --rule-soft: #ECECEE;
+  --accent: #0A84FF;
+  --accent-soft: rgba(10,132,255,0.10);
+  --positive: #1C8B5A;
+  --backup-stripe: #1D1D1F;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+html, body { margin: 0; padding: 0; background: #000; }
+body { font-family: var(--font); color: var(--ink); -webkit-font-smoothing: antialiased; }
+
+/* Slide frame */
+deck-stage section {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  font-feature-settings: "ss01","tnum";
+  letter-spacing: -0.005em;
+}
+
+/* ─── Type scale (px; 1920×1080) ────────────────────────────────── */
+/* title 64 · subtitle 44 · body 34 · small 28 · micro 22 · hero num 220 */
+
+.slide {
+  display: grid;
+  grid-template-rows: 80px 1fr 60px;
+  padding: 100px 120px 56px 120px;
+  box-sizing: border-box;
+}
+.slide.no-header { grid-template-rows: 1fr 60px; padding-top: 100px; }
+
+.eyebrow {
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.eyebrow .dot { color: var(--accent); margin: 0 10px; }
+
+.title {
+  font-size: 64px;
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  margin: 0;
+  color: var(--ink);
+}
+.subtitle {
+  font-size: 44px;
+  font-weight: 400;
+  line-height: 1.15;
+  color: var(--ink-2);
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+.body { font-size: 34px; font-weight: 400; line-height: 1.35; color: var(--ink-2); }
+.small { font-size: 28px; font-weight: 400; line-height: 1.4; color: var(--ink-3); }
+.micro { font-size: 24px; font-weight: 500; letter-spacing: 0.02em; color: var(--ink-3); }
+
+.rule { height: 1px; background: var(--rule); width: 100%; }
+.rule-soft { height: 1px; background: var(--rule-soft); width: 100%; }
+.accent-rule { height: 2px; width: 72px; background: var(--accent); }
+
+/* Footer */
+.footer {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: end;
+  font-size: 24px;
+  color: var(--ink-4);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.footer .left { text-align: left; }
+.footer .center { text-align: center; color: var(--ink-3); }
+.footer .right { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Header */
+.header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 24px;
+}
+
+/* Main content containers */
+.cols-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 80px; align-items: start; height: 100%; min-height: 0; }
+.cols-5-7 { display: grid; grid-template-columns: 5fr 7fr; gap: 80px; align-items: start; height: 100%; min-height: 0; }
+.cols-7-5 { display: grid; grid-template-columns: 7fr 5fr; gap: 80px; align-items: start; height: 100%; min-height: 0; }
+
+/* Image placeholder (thin frame + caption) */
+.placeholder {
+  border: 1px solid var(--rule);
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  min-height: 320px;
+}
+.placeholder .ph-center {
+  text-align: center;
+  color: var(--ink-4);
+  padding: 32px;
+}
+.placeholder .ph-label {
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+.placeholder .ph-hint {
+  font-size: 24px;
+  font-weight: 400;
+  color: var(--ink-4);
+  margin-top: 10px;
+  max-width: 440px;
+  line-height: 1.4;
+}
+.placeholder + .ph-caption {
+  font-size: 24px;
+  color: var(--ink-3);
+  margin-top: 16px;
+  letter-spacing: 0.01em;
+}
+
+/* Big hero number */
+.hero-num {
+  font-size: 220px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.hero-num .unit { color: var(--ink-3); font-weight: 500; font-size: 56px; letter-spacing: -0.02em; margin-left: 16px; }
+.hero-num .sign { color: var(--accent); }
+
+.kpi-stack { display: flex; flex-direction: column; gap: 8px; }
+.kpi-val { font-size: 88px; font-weight: 600; letter-spacing: -0.03em; line-height: 1; font-variant-numeric: tabular-nums; color: var(--ink); }
+.kpi-val .unit { font-size: 32px; color: var(--ink-3); margin-left: 10px; letter-spacing: -0.01em; font-weight: 500; }
+.kpi-label { font-size: 24px; font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); }
+
+/* Table */
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+table.data th, table.data td {
+  text-align: left;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--rule-soft);
+  font-weight: 400;
+}
+table.data thead th {
+  font-size: 24px;
+  font-weight: 500;
+  color: var(--ink-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--rule);
+}
+table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data th.num { text-align: right; }
+table.data tr.best td { color: var(--ink); }
+table.data tr.best td.metric { color: var(--accent); font-weight: 500; }
+table.data td.label { color: var(--ink-2); }
+
+/* Lists */
+ul.tight { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 24px; }
+ul.tight li { font-size: 34px; color: var(--ink-2); line-height: 1.3; padding-left: 28px; position: relative; font-weight: 400; }
+ul.tight li::before { content: ""; position: absolute; left: 0; top: 20px; width: 10px; height: 1px; background: var(--ink-3); }
+ul.tight li b { color: var(--ink); font-weight: 500; }
+
+ul.compact { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 14px; }
+ul.compact li { font-size: 28px; color: var(--ink-2); line-height: 1.35; padding-left: 24px; position: relative; }
+ul.compact li::before { content: ""; position: absolute; left: 0; top: 16px; width: 8px; height: 1px; background: var(--ink-3); }
+
+/* Chip-like markers */
+.chip {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-size: 24px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-soft);
+  padding: 8px 14px; border-radius: 999px;
+}
+
+/* Backup slide styling */
+.slide.backup { padding-left: 160px; position: relative; }
+.slide.backup::before {
+  content: "";
+  position: absolute; left: 0; top: 0; bottom: 0; width: 56px;
+  background: var(--backup-stripe);
+}
+.slide.backup .backup-label {
+  position: absolute;
+  left: 28px; top: 50%;
+  transform: rotate(-90deg) translateX(50%);
+  transform-origin: left center;
+  color: #FFFFFF;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+}
+
+/* Title slide */
+.title-slide {
+  display: grid;
+  grid-template-rows: auto auto;
+  padding: 100px 120px 160px 120px;
+  box-sizing: border-box;
+  row-gap: 80px;
+}
+.title-slide .logo-slot {
+  width: 220px; height: 64px;
+  border: 1px dashed var(--rule);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 24px; color: var(--ink-4); letter-spacing: 0.12em; text-transform: uppercase;
+}
+.title-slide .big-title {
+  font-size: 100px;
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+  font-weight: 600;
+  color: var(--ink);
+  max-width: 1500px;
+  margin: 0;
+}
+.title-slide .sub {
+  font-size: 36px; color: var(--ink-3); margin-top: 32px; letter-spacing: -0.01em; font-weight: 400;
+}
+.title-slide .highlight {
+  border-top: 1px solid var(--rule);
+  padding-top: 40px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 60px;
+  align-items: end;
+}
+.title-slide .key-result-label {
+  font-size: 24px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500; margin-bottom: 14px;
+}
+.title-slide .key-result-val {
+  font-size: 72px; letter-spacing: -0.02em; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums;
+}
+.title-slide .key-result-val .plus { color: var(--positive); }
+.title-slide .meta { font-size: 26px; color: var(--ink-3); line-height: 1.45; }
+
+/* Timeline */
+.timeline { display: grid; grid-template-columns: 10fr 3fr 3fr; gap: 4px; margin-top: 32px; }
+.timeline-seg {
+  border-top: 2px solid var(--ink);
+  padding-top: 16px;
+  position: relative;
+}
+.timeline-seg.train { border-color: var(--ink-2); }
+.timeline-seg.val { border-color: var(--ink-3); }
+.timeline-seg.test { border-color: var(--accent); }
+.timeline-seg .seg-name { font-size: 26px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.timeline-seg.train .seg-name { color: var(--ink-2); }
+.timeline-seg.val .seg-name { color: var(--ink-3); }
+.timeline-seg.test .seg-name { color: var(--accent); }
+.timeline-seg .seg-range { font-size: 24px; color: var(--ink-3); margin-top: 6px; font-variant-numeric: tabular-nums; }
+.timeline-seg .seg-bar {
+  position: absolute; top: -2px; left: 0; height: 2px; background: currentColor;
+}
+
+/* Pipeline */
+.pipeline { display: flex; align-items: center; gap: 16px; margin-top: 24px; flex-wrap: nowrap; }
+.pipe-node {
+  flex: 1;
+  border: 1px solid var(--rule);
+  padding: 24px 20px;
+  text-align: center;
+  font-size: 26px;
+  font-weight: 500;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+.pipe-arrow { color: var(--ink-4); font-size: 32px; font-weight: 300; }
+
+/* Feature groups */
+.feat-groups { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px 40px; }
+.feat-group { }
+.feat-group .fg-head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 12px; }
+.feat-group .fg-name { font-size: 28px; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; }
+.feat-group .fg-count { font-size: 24px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.feat-group .fg-items { font-size: 24px; color: var(--ink-3); line-height: 1.45; font-family: var(--font-mono); letter-spacing: -0.01em; }
+
+/* Bars (horizontal mini-bars for feature importance) */
+.bars { display: flex; flex-direction: column; gap: 18px; }
+.bar-row { display: grid; grid-template-columns: 260px 1fr 80px; gap: 20px; align-items: center; font-size: 24px; }
+.bar-row .bar-name { color: var(--ink); font-family: var(--font-mono); font-size: 24px; }
+.bar-row .bar-track { height: 8px; background: var(--rule-soft); position: relative; }
+.bar-row .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); }
+.bar-row .bar-val { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+
+/* Tweaks panel */
+#tweaks {
+  position: fixed; right: 20px; bottom: 60px;
+  background: rgba(255,255,255,0.98);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 16px 18px;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--ink);
+  z-index: 2147483100;
+  display: none;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+  min-width: 220px;
+}
+#tweaks.on { display: block; }
+#tweaks h4 { margin: 0 0 12px 0; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+#tweaks .tweak-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+#tweaks .tweak-row:last-child { margin-bottom: 0; }
+#tweaks label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
+#tweaks .swatches { display: flex; gap: 6px; }
+#tweaks .sw { width: 24px; height: 24px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; transition: border-color 0.15s; }
+#tweaks .sw[data-active] { border-color: var(--ink); }
+#tweaks select { font-family: var(--font); font-size: 13px; padding: 6px 8px; border: 1px solid var(--rule); border-radius: 6px; background: white; color: var(--ink); }
+</style>
+</head>
+<body>
+
+<deck-stage width="1920" height="1080">
+
+  <!-- ═════════════════════════ 1. TITLE ═════════════════════════ -->
+  <section data-label="Титульный" class="title-slide">
+    <div>
+      <div style="display:flex; align-items:center; justify-content: space-between; margin-bottom: 120px;">
+        <img src="assets/logo-otus-dark.png" alt="OTUS" style="height:56px; width:auto; display:block;">
+        <div class="micro" style="text-align:right;">
+          Machine Learning · Professional<br>
+          <span style="color:var(--ink-4);">Курсовая работа · апрель 2026</span>
+        </div>
+      </div>
+      <div class="accent-rule" style="margin-bottom: 36px;"></div>
+      <h1 class="big-title">Прогнозирование спроса<br>на автоматах быстрого питания</h1>
+      <div class="sub">Шилин Георгий</div>
+    </div>
+    <div class="highlight">
+      <div>
+        <div class="key-result-label">Ключевой результат</div>
+        <div class="key-result-val">MAE <span style="color:var(--ink)">0.597</span></div>
+      </div>
+      <div style="align-self:end;">
+        <div class="key-result-label">Относительно baseline</div>
+        <div class="key-result-val"><span class="plus">−16.2%</span></div>
+      </div>
+      <div class="meta">
+        Test period<br>
+        <span style="color:var(--ink-2); font-weight:500;">2025-12 — 2026-01</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 2. БИЗНЕС-ЗАДАЧА ═════════════════════════ -->
+  <section data-label="Бизнес-задача" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Контекст <span class="dot">·</span> 01</div>
+        <h2 class="title" style="margin-top:14px;">Бизнес-задача</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top: 40px;">
+      <div style="display:flex; flex-direction:column; gap: 48px;">
+        <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div class="micro" style="margin-bottom:12px;">Загрузка автомата — решение в ежедневном цикле</div>
+          <p class="body" style="margin:0;">Ошибка в любую сторону превращается в убыток.</p>
+        </div>
+        <div class="rule"></div>
+        <div style="display:grid; grid-template-columns: 1fr; gap: 32px;">
+          <div>
+            <div class="kpi-label">Лишняя загрузка</div>
+            <div class="kpi-val" style="color:var(--ink-2); font-size:72px; margin-top:8px;">11—21<span class="unit">% списаний</span></div>
+            <div class="small" style="margin-top:8px;">Истечение срока годности</div>
+          </div>
+          <div>
+            <div class="kpi-label">Недозагрузка</div>
+            <div class="body" style="margin-top:8px; color:var(--ink);">Пустой автомат → потерянные продажи</div>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; max-height:760px;">
+        <svg class="biz-schema" viewBox="0 0 840 560" xmlns="http://www.w3.org/2000/svg" style="flex:0 0 auto; width:100%; height:auto; display:block;">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#A1A1A6"/>
+            </marker>
+            <marker id="arrAcc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- STEP 1 — DEMAND FORECAST (scope of this work) -->
+          <g>
+            <rect x="20" y="80" width="260" height="170" fill="none" stroke="var(--accent)" stroke-width="2"/>
+            <rect x="20" y="80" width="260" height="32" fill="var(--accent)"/>
+            <text x="36" y="101" font-family="var(--font)" font-size="14" font-weight="600" letter-spacing="2.0" fill="#FFFFFF">ШАГ 1 · ЭТА РАБОТА</text>
+            <text x="36" y="148" font-family="var(--font)" font-size="24" font-weight="600" fill="#111111">Прогноз спроса</text>
+            <text x="36" y="178" font-family="var(--font)" font-size="15" font-weight="500" letter-spacing="1.8" fill="#6E6E73">ML · CATBOOST</text>
+            <line x1="36" y1="196" x2="264" y2="196" stroke="#ECECEE" stroke-width="1"/>
+            <text x="36" y="222" font-family="var(--font)" font-size="16" fill="#3A3A3C">штуки / товар /</text>
+            <text x="36" y="242" font-family="var(--font)" font-size="16" fill="#3A3A3C">автомат / день</text>
+          </g>
+
+          <!-- arrow 1→2 -->
+          <line x1="288" y1="165" x2="330" y2="165" stroke="#A1A1A6" stroke-width="1.5" marker-end="url(#arr)"/>
+
+          <!-- STEP 2 — LOADING DECISION (future) -->
+          <g>
+            <rect x="340" y="80" width="260" height="170" fill="none" stroke="#D6D6D9" stroke-width="1.5" stroke-dasharray="6 5"/>
+            <text x="356" y="101" font-family="var(--font)" font-size="14" font-weight="600" letter-spacing="2.0" fill="#A1A1A6">ШАГ 2 · СЛЕДУЮЩИЙ ШАГ</text>
+            <text x="356" y="148" font-family="var(--font)" font-size="24" font-weight="600" fill="#6E6E73">Решение о загрузке</text>
+            <text x="356" y="178" font-family="var(--font)" font-size="15" font-weight="500" letter-spacing="1.8" fill="#A1A1A6">ОПТИМИЗАЦИЯ</text>
+            <line x1="356" y1="196" x2="584" y2="196" stroke="#ECECEE" stroke-width="1"/>
+            <text x="356" y="222" font-family="var(--font)" font-size="16" fill="#6E6E73">сколько единиц</text>
+            <text x="356" y="242" font-family="var(--font)" font-size="16" fill="#6E6E73">загрузить</text>
+          </g>
+
+          <!-- split arrows 2 → two outcomes -->
+          <line x1="608" y1="130" x2="680" y2="75" stroke="#A1A1A6" stroke-width="1.5" marker-end="url(#arr)"/>
+          <line x1="608" y1="200" x2="680" y2="255" stroke="#A1A1A6" stroke-width="1.5" marker-end="url(#arr)"/>
+
+          <!-- OUTCOME A — Overload -->
+          <g>
+            <text x="692" y="42" font-family="var(--font)" font-size="13" font-weight="500" letter-spacing="1.6" fill="#A1A1A6">ПЕРЕЗАГРУЗКА</text>
+            <rect x="688" y="52" width="140" height="100" fill="none" stroke="#D6D6D9" stroke-width="1"/>
+            <text x="704" y="84" font-family="var(--font)" font-size="16" font-weight="500" fill="#111111">Списания</text>
+            <text x="704" y="104" font-family="var(--font)" font-size="13" fill="#6E6E73">истечение срока</text>
+            <text x="704" y="136" font-family="var(--font)" font-size="24" font-weight="600" fill="var(--accent)" letter-spacing="-0.5">11—21%</text>
+          </g>
+
+          <!-- OUTCOME B — Underload -->
+          <g>
+            <text x="692" y="222" font-family="var(--font)" font-size="13" font-weight="500" letter-spacing="1.6" fill="#A1A1A6">НЕДОЗАГРУЗКА</text>
+            <rect x="688" y="232" width="140" height="100" fill="none" stroke="#D6D6D9" stroke-width="1"/>
+            <text x="704" y="264" font-family="var(--font)" font-size="16" font-weight="500" fill="#111111">Пустой слот</text>
+            <text x="704" y="284" font-family="var(--font)" font-size="13" fill="#6E6E73">потерянные</text>
+            <text x="704" y="302" font-family="var(--font)" font-size="13" fill="#6E6E73">продажи</text>
+          </g>
+
+          <!-- Legend / scope note -->
+          <g>
+            <line x1="20" y1="470" x2="820" y2="470" stroke="#ECECEE" stroke-width="1"/>
+            <rect x="20" y="500" width="16" height="16" fill="var(--accent)"/>
+            <text x="46" y="513" font-family="var(--font)" font-size="16" font-weight="500" fill="#111111">In scope</text>
+            <text x="46" y="533" font-family="var(--font)" font-size="14" fill="#6E6E73">Прогноз спроса · CatBoost</text>
+
+            <rect x="280" y="500" width="16" height="16" fill="none" stroke="#D6D6D9" stroke-dasharray="3 3"/>
+            <text x="306" y="513" font-family="var(--font)" font-size="16" font-weight="500" fill="#6E6E73">Out of scope</text>
+            <text x="306" y="533" font-family="var(--font)" font-size="14" fill="#A1A1A6">Оптимизатор загрузки</text>
+          </g>
+        </svg>
+        <div class="ph-caption">Рис. 1. Прогноз спроса — промежуточный шаг перед решением о загрузке.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Бизнес-задача</div>
+      <div class="right">01 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 3. ML-ЗАДАЧА ═════════════════════════ -->
+  <section data-label="ML-задача" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Постановка <span class="dot">·</span> 02</div>
+        <h2 class="title" style="margin-top:14px;">ML-задача</h2>
+      </div>
+    </div>
+    <div style="padding-top: 40px;">
+      <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap: 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);">
+        <div style="padding: 40px 32px 40px 0; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label" style="margin-bottom: 20px;">Тип</div>
+          <div class="subtitle" style="color:var(--ink); font-weight:500;">Регрессия</div>
+        </div>
+        <div style="padding: 40px 32px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label" style="margin-bottom: 20px;">Target</div>
+          <div class="subtitle" style="color:var(--ink); font-family:var(--font-mono); font-size:36px; font-weight:500;">total_qty</div>
+          <div class="small" style="margin-top:10px;">шт / день</div>
+        </div>
+        <div style="padding: 40px 32px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label" style="margin-bottom: 20px;">Гранулярность</div>
+          <div class="subtitle" style="color:var(--ink); font-weight:500; font-size:34px;">автомат ×<br>товар × день</div>
+        </div>
+        <div style="padding: 40px 32px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label" style="margin-bottom: 20px;">Горизонт</div>
+          <div class="subtitle" style="color:var(--ink); font-weight:500;">1 день</div>
+          <div class="small" style="margin-top:10px;">следующая загрузка</div>
+        </div>
+        <div style="padding: 40px 0 40px 32px;">
+          <div class="kpi-label" style="margin-bottom: 20px;">Метрика</div>
+          <div class="subtitle" style="color:var(--accent); font-weight:600;">MAE</div>
+          <div class="small" style="margin-top:10px;">штуки → деньги</div>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 80px; margin-top: 56px;">
+        <div>
+          <div class="micro" style="margin-bottom: 12px;">Почему MAE</div>
+          <p class="body" style="margin:0; color:var(--ink-2);">Ошибка в штуках напрямую интерпретируется в списания и потерянную выручку. Устойчива к редким выбросам в продажах.</p>
+        </div>
+        <div>
+          <div class="micro" style="margin-bottom: 12px;">Почему 1 день</div>
+          <p class="body" style="margin:0; color:var(--ink-2);">Соответствует реальному циклу загрузки. Более длинные горизонты отложены на будущее.</p>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">ML-задача</div>
+      <div class="right">02 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 4. ДАННЫЕ И SPLIT ═════════════════════════ -->
+  <section data-label="Данные и split" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Датасет <span class="dot">·</span> 03</div>
+        <h2 class="title" style="margin-top:14px;">Данные и split</h2>
+      </div>
+    </div>
+    <div style="padding-top: 40px; display:flex; flex-direction:column; gap: 64px;">
+      <!-- KPI row -->
+      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 80px; border-top: 1px solid var(--rule); padding-top: 36px;">
+        <div class="kpi-stack">
+          <div class="kpi-val">3.46<span class="unit">млн</span></div>
+          <div class="kpi-label">строк</div>
+        </div>
+        <div class="kpi-stack">
+          <div class="kpi-val">321</div>
+          <div class="kpi-label">автоматов</div>
+        </div>
+        <div class="kpi-stack">
+          <div class="kpi-val">890</div>
+          <div class="kpi-label">товаров</div>
+        </div>
+      </div>
+
+      <!-- Timeline -->
+      <div>
+        <div style="display:flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px;">
+          <div class="micro">Temporal split · строго по времени, без перемешивания</div>
+          <div class="micro" style="font-variant-numeric:tabular-nums;">2024-01 ——————— 2026-01</div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-seg train">
+            <div class="seg-name">Train</div>
+            <div class="seg-range">2024-01 — 2025-08</div>
+            <div class="small" style="margin-top:4px;">20 месяцев</div>
+          </div>
+          <div class="timeline-seg val">
+            <div class="seg-name">Val</div>
+            <div class="seg-range">2025-09 — 2025-11</div>
+            <div class="small" style="margin-top:4px;">3 месяца</div>
+          </div>
+          <div class="timeline-seg test">
+            <div class="seg-name">Test</div>
+            <div class="seg-range">2025-12 — 2026-01</div>
+            <div class="small" style="margin-top:4px;">2 месяца</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Note -->
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 80px; border-top: 1px solid var(--rule-soft); padding-top: 32px;">
+        <div class="small">Имитирует продакшен-деплой: модель обучается на прошлом и предсказывает будущее.</div>
+        <div class="small">Разбиение покрывает будни, выходные и праздничные провалы.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Данные и split</div>
+      <div class="right">03 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 5. SPLIT · ВИЗУАЛЬНО ═════════════════════════ -->
+  <section data-label="Split · визуально" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Датасет <span class="dot">·</span> 04</div>
+        <h2 class="title" style="margin-top:14px;">Данные на таймлайне</h2>
+      </div>
+    </div>
+    <div style="padding-top:40px; display:flex; flex-direction:column; gap: 24px; min-height:0; height: 100%; box-sizing:border-box;">
+      <div style="flex:1; min-height:0; display:flex; align-items:center; justify-content:center; background:#FFFFFF; border:1px solid var(--rule-soft); padding: 24px; box-sizing:border-box;">
+        <img src="assets/presentation_temporal_split.png"
+             alt="Ежедневные продажи по всей сети с подсветкой периодов Train, Val, Test"
+             style="max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; display:block;">
+      </div>
+      <div class="ph-caption">Ежедневные продажи по всей сети, 2024-01 — 2026-01. Подсвечены Train (20 мес.), Val (3 мес.), Test (2 мес.).</div>
+      <div style="border-top: 1px solid var(--rule-soft); padding-top: 24px; display:grid; grid-template-columns: 1fr 1fr; gap: 80px;">
+        <div class="small"><b style="color:var(--ink); font-weight:500;">Офисный паттерн.</b> Будние пики, провалы на выходных — видно на всём диапазоне.</div>
+        <div class="small"><b style="color:var(--ink); font-weight:500;">Split репрезентативен.</b> Val и Test захватывают полные недельные циклы — без искажений на границах.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Данные на таймлайне</div>
+      <div class="right">04 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 6. EDA ═════════════════════════ -->
+  <section data-label="EDA" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Исследование данных <span class="dot">·</span> 05</div>
+        <h2 class="title" style="margin-top:14px;">EDA</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px;">
+      <div style="display:flex; flex-direction:column; gap: 40px;">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 40px; border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div class="kpi-stack">
+            <div class="kpi-val" style="font-size:96px;">1<span class="unit">шт</span></div>
+            <div class="kpi-label">Медиана продаж / день</div>
+          </div>
+          <div class="kpi-stack">
+            <div class="kpi-val" style="font-size:96px;">4<span class="unit">шт</span></div>
+            <div class="kpi-label">95% продаж ≤</div>
+          </div>
+        </div>
+        <div class="rule-soft"></div>
+        <ul class="compact">
+          <li><b style="color:var(--ink); font-weight:500;">Офисный паттерн.</b> Всплески в будние дни, провалы на выходных.</li>
+          <li><b style="color:var(--ink); font-weight:500;">Длинный хвост.</b> Распределение сильно скошено вправо.</li>
+          <li><b style="color:var(--ink); font-weight:500;">Цензурированный спрос.</b> Ноль продаж ≠ нулевой спрос, когда товар закончился.</li>
+        </ul>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; max-height:760px;">
+        <div style="flex:1; min-height:0; display:flex; align-items:center; justify-content:center; background:#FFFFFF; border:1px solid var(--rule-soft); padding: 20px; box-sizing:border-box;">
+          <img src="assets/eda_slide5_dual.png"
+               alt="Продажи по дням недели (офисный паттерн) и распределение total_qty (1–15, 99.7%)"
+               style="max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; display:block;">
+        </div>
+        <div class="ph-caption">Рис. 2. Офисный паттерн (Сб/Вс в 8× меньше) и распределение <span style="font-family:var(--font-mono);">total_qty</span> (1–15, 99.7%).</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">EDA</div>
+      <div class="right">05 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 6. ЧИСТКА ДАННЫХ: РАССЛЕДОВАНИЕ ═════════════════════════ -->
+  <section data-label="Чистка данных: расследование" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Data Quality <span class="dot">·</span> 06</div>
+        <h2 class="title" style="margin-top:14px;">Чистка данных: расследование</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px;">
+      <div style="display:flex; flex-direction:column; gap: 28px;">
+        <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div class="micro" style="margin-bottom:16px;">Что нашли в сырых данных</div>
+          <ul class="compact">
+            <li><b style="color:var(--ink); font-weight:500;">Дубли и тестовые записи.</b> 161K дублей продаж, 703K дублей остатков.</li>
+            <li><b style="color:var(--ink); font-weight:500;">Нестабильные точки.</b> Сбои передачи данных ≠ падение спроса.</li>
+            <li><b style="color:var(--ink); font-weight:500;">Ноль продаж ≠ ноль спроса.</b> Товар мог просто закончиться.</li>
+          </ul>
+        </div>
+        <div style="border-top: 1px solid var(--rule-soft); padding-top: 24px;">
+          <div class="small">Чистка данных — не формальность, а отдельное расследование.</div>
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 40px; justify-content:center;">
+        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 0; border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div style="padding-right:32px; border-right: 1px solid var(--rule-soft);">
+            <div class="kpi-val" style="font-size:72px;">161<span class="unit">K</span></div>
+            <div class="kpi-label" style="margin-top:6px;">Продажи: дубликатов</div>
+          </div>
+          <div style="padding: 0 32px; border-right: 1px solid var(--rule-soft);">
+            <div class="kpi-val" style="font-size:72px;">703<span class="unit">K</span></div>
+            <div class="kpi-label" style="margin-top:6px;">Остатки: дубликатов</div>
+          </div>
+          <div style="padding-left:32px;">
+            <div class="kpi-val" style="font-size:72px;">9</div>
+            <div class="kpi-label" style="margin-top:6px;">Фильтров</div>
+          </div>
+        </div>
+        <div class="pipeline">
+          <div class="pipe-node">сырая БД</div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node">подозрения</div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node">проверки</div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" style="border-color:var(--accent); color:var(--accent);">источники шума</div>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Чистка данных: расследование</div>
+      <div class="right">06 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 7. ЧИСТКА ДАННЫХ: AVAILABILITY ═════════════════════════ -->
+  <section data-label="Чистка данных: availability" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Data Quality <span class="dot">·</span> 07</div>
+        <h2 class="title" style="margin-top:14px;">Что реально улучшило сигнал</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px;">
+      <div style="display:flex; flex-direction:column; gap: 28px;">
+        <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div class="micro" style="margin-bottom:16px;">Ключевые выводы</div>
+          <ul class="compact">
+            <li><b style="color:var(--ink); font-weight:500;">Данные фиксируют продажи,</b> а не спрос.</li>
+            <li><b style="color:var(--ink); font-weight:500;">Три вида нуля:</b> нет спроса, нет товара, нет связи.</li>
+            <li><b style="color:var(--ink); font-weight:500;">Actual Menu</b> — полезен как диагностика, не как отдельный признак.</li>
+            <li><b style="color:var(--ink); font-weight:500;">Availability</b> — работает при надёжных данных о загрузке.</li>
+          </ul>
+        </div>
+        <div style="border-top: 1px solid var(--rule-soft); padding-top: 24px;">
+          <div class="small">Лучший эффект дал не жёсткая чистка, а понимание скрытого спроса.</div>
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 40px; justify-content:center;">
+        <div style="display:flex; flex-direction:column; gap: 0; border-top: 1px solid var(--rule); padding-top: 28px;">
+          <table class="data" style="font-size:24px;">
+            <thead>
+              <tr>
+                <th>Подход</th>
+                <th>Эффект</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="label">Только продажи</td>
+                <td class="label" style="color:var(--ink-3);">Ложные нули</td>
+              </tr>
+              <tr>
+                <td class="label">+ контекст остатков/загрузок</td>
+                <td class="label" style="color:var(--ink-3);">Лучший сигнал спроса</td>
+              </tr>
+              <tr class="best">
+                <td class="label"><b style="font-weight:500;">+ защищённая логика</b></td>
+                <td class="label metric">~2% ниже Test MAE</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="text-align:center;">
+          <div class="hero-num" style="font-size:120px;">~2<span class="unit">%</span></div>
+          <div class="kpi-label" style="margin-top: 12px;">ниже Test MAE · защищённый Availability</div>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Чистка данных: availability</div>
+      <div class="right">07 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 8. ПРЕДОБРАБОТКА ═════════════════════════ -->
+  <section data-label="Предобработка" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Pipeline <span class="dot">·</span> 08</div>
+        <h2 class="title" style="margin-top:14px;">Предобработка</h2>
+      </div>
+    </div>
+    <div style="padding-top:40px; display:flex; flex-direction:column; gap: 56px;">
+      <div class="pipeline" style="border-top: 1px solid var(--rule); padding-top: 48px;">
+        <div class="pipe-node">PostgreSQL</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node">clean</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node">parquet</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node">features</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node" style="border-color:var(--accent); color:var(--accent);">model</div>
+      </div>
+
+      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 0; border-top: 1px solid var(--rule); padding-top: 36px;">
+        <div style="padding-right:48px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-val" style="font-size:96px;">9</div>
+          <div class="kpi-label" style="margin-top:6px;">Фильтров</div>
+          <div class="small" style="margin-top:16px;">Невалидные даты, нулевые цены, тестовые автоматы, out-of-scope SKU.</div>
+        </div>
+        <div style="padding: 0 48px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-val" style="font-size:96px;">161<span class="unit">K</span></div>
+          <div class="kpi-label" style="margin-top:6px;">Дублей продаж</div>
+          <div class="small" style="margin-top:16px;">Дедуплицировано по transaction_id.</div>
+        </div>
+        <div style="padding-left:48px;">
+          <div class="kpi-val" style="font-size:96px;">703<span class="unit">K</span></div>
+          <div class="kpi-label" style="margin-top:6px;">Дублей остатков</div>
+          <div class="small" style="margin-top:16px;">Снапшоты остатков, свёрнутые по (автомат, товар, дата).</div>
+        </div>
+      </div>
+
+      <div class="small" style="border-top: 1px solid var(--rule-soft); padding-top: 28px;">
+        Дедупликация критична: двойной учёт продажи напрямую искажает target.
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Предобработка</div>
+      <div class="right">08 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 9. FEATURE ENGINEERING ═════════════════════════ -->
+  <section data-label="Feature engineering" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Признаки <span class="dot">·</span> 09</div>
+        <h2 class="title" style="margin-top:14px;">Feature engineering</h2>
+      </div>
+      <div style="text-align:right;">
+        <div class="kpi-val" style="font-size:96px; line-height:1;">23</div>
+        <div class="kpi-label" style="margin-top:20px;">признака · 6 групп</div>
+      </div>
+    </div>
+    <div style="padding-top: 80px; display:flex; flex-direction:column; gap: 72px;">
+      <div class="feat-groups" style="border-top: 1px solid var(--rule); padding-top: 28px;">
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Категориальные</div><div class="fg-count">3</div></div>
+          <div class="fg-items">point_id, goods_id,<br>general_category_name</div>
+        </div>
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Календарные</div><div class="fg-count">5</div></div>
+          <div class="fg-items">day_of_week, month,<br>is_weekend, is_holiday,<br>day_of_month</div>
+        </div>
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Лаги</div><div class="fg-count">3</div></div>
+          <div class="fg-items">lag_1d, lag_7d,<br>lag_14d</div>
+        </div>
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Rolling</div><div class="fg-count">5</div></div>
+          <div class="fg-items">rolling_mean_7d, rolling_mean_14d,<br>rolling_mean_30d, rolling_median_7d,<br>rolling_std_7d</div>
+        </div>
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Остатки</div><div class="fg-count">3</div></div>
+          <div class="fg-items">days_since_last_load,<br>last_load_qty, last_expiry_qty</div>
+        </div>
+        <div class="feat-group">
+          <div class="fg-head"><div class="fg-name">Цена</div><div class="fg-count">4</div></div>
+          <div class="fg-items">avg_price_rub, catalog_price_rub,<br>had_discount, had_promo</div>
+        </div>
+      </div>
+      <div style="border-top: 1px solid var(--rule); padding-top: 28px; display:grid; grid-template-columns: auto 1fr; gap: 40px; align-items:center;">
+        <div class="chip">Leakage guard · shift(1)</div>
+        <div class="body" style="margin:0;">Все лаги и rolling рассчитаны с <code style="font-family:var(--font-mono); color:var(--ink);">.shift(1)</code> — на момент предсказания в фичах нет информации о целевом дне.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Feature engineering</div>
+      <div class="right">09 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 10. BASELINE ═════════════════════════ -->
+  <section data-label="Baseline" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Сравнение <span class="dot">·</span> 10</div>
+        <h2 class="title" style="margin-top:14px;">Baseline</h2>
+      </div>
+    </div>
+    <div class="cols-7-5" style="padding-top:40px;">
+      <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Модель</th>
+              <th>Описание</th>
+              <th class="num">Val MAE</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="label">Global Mean</td>
+              <td class="label" style="color:var(--ink-3);">Среднее по всему train</td>
+              <td class="num">0.886</td>
+            </tr>
+            <tr>
+              <td class="label">Group Mean</td>
+              <td class="label" style="color:var(--ink-3);">По паре (автомат, товар)</td>
+              <td class="num">0.755</td>
+            </tr>
+            <tr>
+              <td class="label">Lag-1</td>
+              <td class="label" style="color:var(--ink-3);">Продажи вчера</td>
+              <td class="num">0.784</td>
+            </tr>
+            <tr class="best">
+              <td class="label"><b style="font-weight:500;">Rolling Mean 7d</b></td>
+              <td class="label" style="color:var(--ink-3);">Среднее за последнюю неделю</td>
+              <td class="num metric">0.658</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="small" style="margin-top: 36px; border-top: 1px solid var(--rule-soft); padding-top: 20px;">
+          Нижняя граница, с которой сравнивается CatBoost.
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; align-items:flex-start;">
+        <div class="micro">Лучший простой бейзлайн</div>
+        <div style="margin-top: 8px;">
+          <div class="hero-num">0.658</div>
+          <div class="kpi-label" style="margin-top: 16px;">Rolling Mean 7d · Val MAE</div>
+        </div>
+        <div class="small" style="margin-top: 28px; max-width: 400px;">
+          Семидневное скользящее среднее уже захватывает недельную сезонность офисного паттерна.
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Baseline</div>
+      <div class="right">10 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 11. OPTUNA ═════════════════════════ -->
+  <section data-label="Optuna" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Тюнинг <span class="dot">·</span> 11</div>
+        <h2 class="title" style="margin-top:14px;">Optuna</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px;">
+      <div style="display:flex; flex-direction:column; gap: 28px;">
+        <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+          <div class="kpi-label">Trials</div>
+          <div class="kpi-val" style="font-size:96px; margin-top:8px;">53</div>
+        </div>
+        <div>
+          <div class="kpi-label">Val MAE</div>
+          <div class="kpi-val" style="font-size:72px; margin-top:8px;">0.5623</div>
+        </div>
+        <div class="rule-soft" style="margin-top: 8px;"></div>
+        <ul class="compact">
+          <li>Пространство поиска: depth, lr, l2_leaf_reg, subsample</li>
+          <li>Лучший trial на validation: Val MAE 0.5623</li>
+          <li>Вывод: локальный тюнинг помогает, но не меняет задачу радикально</li>
+        </ul>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; align-self: stretch;">
+        <div style="flex:1 1 auto; min-height:0; background:#FFFFFF; border:1px solid var(--rule-soft); padding: 28px 40px; box-sizing:border-box; display:flex; align-items:center; justify-content:center;">
+          <img src="assets/optuna_trials.png"
+               alt="Optuna · история поиска: Val MAE по trials, лучший trial 0.5623"
+               style="display:block; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain;">
+        </div>
+        <div class="ph-caption" style="flex:0 0 auto; margin-bottom: 12px;">Рис. 3. История оптимизации. Тюнинг помогает локально, но главный резерв качества был не только в гиперпараметрах.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Optuna · тюнинг</div>
+      <div class="right">11 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 12. CATBOOST ═════════════════════════ -->
+  <section data-label="CatBoost" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Основная модель <span class="dot">·</span> 12</div>
+        <h2 class="title" style="margin-top:14px;">CatBoost</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px; box-sizing:border-box;">
+      <div style="display:flex; flex-direction:column; gap: 14px; border-top: 1px solid var(--rule); padding-top: 24px;">
+          <div class="micro">Финальная модель</div>
+        <div>
+          <div class="hero-num" style="font-size:150px;">0.597<span class="unit">MAE</span></div>
+          <div class="kpi-label" style="margin-top: 4px;">Test · 2025-12 — 2026-01</div>
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 24px; border-top: 1px solid var(--rule); padding-top: 18px;">
+          <div>
+            <div class="kpi-label">Val MAE</div>
+            <div class="kpi-val" style="font-size:48px; margin-top:6px;">0.549</div>
+          </div>
+          <div>
+            <div class="kpi-label">vs. baseline</div>
+            <div class="kpi-val" style="font-size:48px; margin-top:6px; color:var(--positive);">−16.2<span class="unit" style="color:var(--positive);">%</span></div>
+          </div>
+        </div>
+        <table class="data" style="margin-top: 0; font-size:22px;">
+          <tbody>
+            <tr><td class="label" style="padding:8px 16px;">depth</td><td class="num" style="color:var(--accent); font-weight:500; padding:8px 16px;">8</td></tr>
+            <tr><td class="label" style="padding:8px 16px;">iterations</td><td class="num" style="padding:8px 16px;">~933 <span style="color:var(--ink-4);">(early stop)</span></td></tr>
+            <tr><td class="label" style="padding:8px 16px;">learning_rate</td><td class="num" style="padding:8px 16px;">0.05</td></tr>
+            <tr><td class="label" style="padding:8px 16px;">loss</td><td class="num" style="padding:8px 16px;">MAE</td></tr>
+            <tr><td class="label" style="padding:8px 16px;">cat_features</td><td class="num" style="padding:8px 16px;">native</td></tr>
+          </tbody>
+        </table>
+        <div class="small" style="margin-top: 0; color: var(--ink-3);">Optuna (53 trials) подтвердил: depth=8 оптимален · Δ&nbsp;=&nbsp;0.0001</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; align-self: stretch;">
+        <div style="flex:0 1 auto; height: 690px; min-height:0; background:#FFFFFF; border:1px solid var(--rule-soft); padding: 24px 36px; box-sizing:border-box; display:flex; align-items:center; justify-content:center;">
+          <img src="assets/pred_vs_actual_final.png"
+               alt="Прогноз vs факт · CatBoost final: hexbin-диаграмма, Test MAE 0.597"
+               style="display:block; max-width:96%; max-height:96%; width:auto; height:auto; object-fit:contain;">
+        </div>
+        <div class="ph-caption" style="flex:0 0 auto; font-size:24px; color:var(--ink-3);">Рис. 4. Прогноз vs факт на тесте. Hexbin, 99.8% точек, диагональ — идеал.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">CatBoost</div>
+      <div class="right">12 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 13. ПЕРЕОБУЧЕНИЕ ═════════════════════════ -->
+  <section data-label="Переобучение" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Диагностика <span class="dot">·</span> 13</div>
+        <h2 class="title" style="margin-top:14px;">Переобучение</h2>
+      </div>
+    </div>
+    <div class="cols-5-7" style="padding-top:40px;">
+      <div style="display:flex; flex-direction:column; gap: 32px; border-top: 1px solid var(--rule); padding-top: 28px;">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 0;">
+          <div style="padding-right: 24px; border-right: 1px solid var(--rule-soft);">
+            <div class="kpi-label">Train MAE</div>
+            <div class="kpi-val" style="font-size:88px; margin-top:8px;">0.492</div>
+          </div>
+          <div style="padding-left: 24px;">
+            <div class="kpi-label">Val MAE</div>
+            <div class="kpi-val" style="font-size:88px; margin-top:8px;">0.549</div>
+          </div>
+        </div>
+        <div style="border-top: 1px solid var(--rule-soft); padding-top: 24px;">
+          <div class="kpi-label">Разрыв</div>
+          <div class="kpi-val" style="font-size:96px; color:var(--accent); margin-top:8px;">10.4<span class="unit" style="color:var(--accent);">%</span></div>
+          <div class="small" style="margin-top: 12px;">Умеренно. Early stopping остановил рост на ≈933 деревьях.</div>
+        </div>
+        <ul class="compact" style="margin-top: 8px;">
+          <li>L2 регуляризация по умолчанию</li>
+          <li>Early stopping по Val MAE, patience 50</li>
+          <li>Дальнейшее сокращение gap требует больше данных, не тюнинга</li>
+        </ul>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; align-self: stretch;">
+        <div style="flex:0 1 auto; height: 690px; min-height:0; background:#FFFFFF; border:1px solid var(--rule-soft); padding: 24px 36px; box-sizing:border-box; display:flex; align-items:center; justify-content:center;">
+          <img src="assets/learning_curve_final.png"
+               alt="Learning curve CatBoost depth=8: Train MAE 0.492, Val MAE 0.549, gap 10.4%, early stop на 933 деревьях"
+               style="display:block; max-width:96%; max-height:96%; width:auto; height:auto; object-fit:contain;">
+        </div>
+        <div class="ph-caption" style="flex:0 0 auto;">Рис. 5. Learning curve · CatBoost depth=8. Early stopping на ≈933 деревьях; gap 10.4%.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Переобучение</div>
+      <div class="right">13 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 14. FEATURE IMPORTANCE & SHAP ═════════════════════════ -->
+  <section data-label="Feature importance и SHAP" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Интерпретация <span class="dot">·</span> 14</div>
+        <h2 class="title" style="margin-top:14px;">Feature importance и SHAP</h2>
+      </div>
+    </div>
+    <div class="cols-7-5" style="padding-top:40px;">
+      <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+        <div class="micro" style="margin-bottom: 32px;">Top-7 признаков · доля importance</div>
+        <div class="bars">
+          <div class="bar-row">
+            <div class="bar-name">rolling_mean_30d</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 100%;"></div></div>
+            <div class="bar-val">22.4%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">rolling_mean_7d</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 76%;"></div></div>
+            <div class="bar-val">17.1%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">rolling_sum_14d</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 42%;"></div></div>
+            <div class="bar-val">9.5%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">price</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 38%;"></div></div>
+            <div class="bar-val">8.5%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">product_id</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 33%;"></div></div>
+            <div class="bar-val">7.4%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">dow</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 28%;"></div></div>
+            <div class="bar-val">6.3%</div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-name">discount_pct</div>
+            <div class="bar-track"><div class="bar-fill" style="width: 22%;"></div></div>
+            <div class="bar-val">5.0%</div>
+          </div>
+        </div>
+        <div class="small" style="margin-top: 32px; border-top: 1px solid var(--rule-soft); padding-top: 20px;">
+          Rolling-группа суммарно — <b style="color:var(--ink); font-weight:500;">~49%</b>. История продаж доминирует.
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap: 16px; min-height:0; align-self: start; margin-top: -140px;">
+        <div style="background:#FFFFFF; border:1px solid var(--rule-soft); padding: 28px 40px 8px 40px; box-sizing:border-box; display:flex; align-items:center; justify-content:center; height: 702px;">
+          <img src="assets/shap_beeswarm.png"
+               alt="SHAP beeswarm · top-10 признаков по среднему |SHAP|"
+               style="display:block; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain;">
+        </div>
+        <div class="ph-caption" style="flex:0 0 auto;">Рис. 6. SHAP подтверждает вывод: direction эффекта rolling-фич совпадает с ожиданием.</div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Feature importance и SHAP</div>
+      <div class="right">14 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 15. СРАВНЕНИЕ МОДЕЛЕЙ ═════════════════════════ -->
+  <section data-label="Сравнение моделей" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Эксперименты <span class="dot">·</span> 15</div>
+        <h2 class="title" style="margin-top:14px;">Сравнение моделей</h2>
+      </div>
+    </div>
+    <div class="cols-7-5" style="padding-top:40px;">
+      <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Модель</th>
+              <th class="num">Val MAE</th>
+              <th class="num">Test MAE</th>
+              <th class="num">Δ vs. baseline</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="label">Rolling Mean 7d</td>
+              <td class="num">0.658</td>
+              <td class="num">0.712</td>
+              <td class="num" style="color:var(--ink-4);">baseline</td>
+            </tr>
+            <tr class="best">
+              <td class="label"><b style="font-weight:500;">CatBoost</b></td>
+              <td class="num">0.549</td>
+              <td class="num metric">0.597</td>
+              <td class="num" style="color:var(--accent);">−16.2%</td>
+            </tr>
+            <tr>
+              <td class="label">XGBoost</td>
+              <td class="num">0.572</td>
+              <td class="num">0.606</td>
+              <td class="num" style="color:var(--accent);">−14.9%</td>
+            </tr>
+            <tr>
+              <td class="label">LightGBM</td>
+              <td class="num">0.550</td>
+              <td class="num">0.599</td>
+              <td class="num" style="color:var(--accent);">−15.9%</td>
+            </tr>
+            <tr>
+              <td colspan="4" style="padding:10px 12px 6px; font-size:13px; font-weight:600; color:var(--ink-4); letter-spacing:0.04em; border-bottom:1px solid var(--rule-soft);">НЕЙРОСЕТИ</td>
+            </tr>
+            <tr>
+              <td class="label">MLP</td>
+              <td class="num">0.616</td>
+              <td class="num">0.677</td>
+              <td class="num" style="color:var(--ink-4);">−4.9%</td>
+            </tr>
+            <tr>
+              <td class="label">Conv1D</td>
+              <td class="num">0.606</td>
+              <td class="num">0.661</td>
+              <td class="num" style="color:var(--ink-4);">−7.2%</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="small" style="margin-top: 20px; border-top: 1px solid var(--rule-soft); padding-top: 12px;">
+          Единый fixed-rolling контракт: одинаковый split, один набор признаков и единая метрика MAE.
+        </div>
+      </div>
+      <div>
+        <div class="micro" style="margin-bottom: 16px;">Что видно на сравнении</div>
+        <ul class="compact">
+          <li>CatBoost — лучший результат на едином сравнении</li>
+          <li>Все бустинги уверенно лучше baseline</li>
+          <li>Нейросети уступают на табличных данных</li>
+          <li>CatBoost сочетает качество и интерпретируемость</li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Сравнение моделей</div>
+      <div class="right">15 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 16. ВЫВОДЫ И ОШИБКИ ═════════════════════════ -->
+  <section data-label="Выводы и ошибки" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Итоги <span class="dot">·</span> 16</div>
+        <h2 class="title" style="margin-top:14px;">Выводы и ошибки</h2>
+      </div>
+    </div>
+    <div style="padding-top:40px; display:flex; flex-direction:column; gap: 56px;">
+      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 0; border-top: 1px solid var(--rule); padding-top: 36px;">
+        <div style="padding-right:48px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label">Test MAE</div>
+          <div class="kpi-val" style="font-size:128px; margin-top:12px;">0.597</div>
+          <div class="small" style="margin-top:16px;"><span style="color:var(--positive); font-weight:500;">−16.2%</span> vs. Rolling Mean 7d</div>
+        </div>
+        <div style="padding: 0 48px; border-right: 1px solid var(--rule-soft);">
+          <div class="kpi-label">Средняя ошибка</div>
+          <div class="kpi-val" style="font-size:128px; margin-top:12px;">&lt; 1<span class="unit">шт</span></div>
+          <div class="small" style="margin-top:16px;">По порядку величины — одна единица товара</div>
+        </div>
+        <div style="padding-left:48px;">
+          <div class="kpi-label">Главный риск</div>
+          <div class="kpi-val" style="font-size:108px; margin-top:12px; color:var(--accent);">0 ≠ 0</div>
+          <div class="small" style="margin-top:16px;">Ноль продаж не равен нулевому спросу</div>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 80px; border-top: 1px solid var(--rule-soft); padding-top: 28px;">
+        <div>
+          <div class="micro" style="margin-bottom: 16px;">Источник ошибки</div>
+          <p class="body" style="margin:0; color:var(--ink-2);">Цензурированный спрос: если товар закончился, продажи падают до нуля, хотя реальный спрос мог остаться высоким.</p>
+        </div>
+        <div>
+          <div class="chip" style="margin-bottom: 16px;">Следующий шаг</div>
+          <p class="body" style="margin:0; color:var(--ink);"><b style="font-weight:500;">Спрос с учётом доступности товара.</b> Явно моделировать факт наличия товара, обучаться только на днях с подтверждённой доступностью.</p>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Выводы и ошибки</div>
+      <div class="right">16 / 17</div>
+    </div>
+  </section>
+
+  <!-- ═════════════════════════ 17. ДОСТУПНОСТЬ И СЛЕДУЮЩИЕ ШАГИ ═════════════════════════ -->
+  <section data-label="Доступность товара и следующие шаги" class="slide">
+    <div class="header">
+      <div>
+        <div class="eyebrow">Развитие <span class="dot">·</span> 17</div>
+        <h2 class="title" style="margin-top:14px;">Доступность товара и следующие шаги</h2>
+      </div>
+    </div>
+    <div style="padding-top:40px; display:flex; flex-direction:column; gap: 48px;">
+      <div style="border-top: 1px solid var(--rule); padding-top: 28px;">
+        <div class="micro" style="margin-bottom: 16px;">Ограничение текущей модели</div>
+        <p class="subtitle" style="margin:0; color:var(--ink);">Цензурированный спрос: ноль продаж при пустом слоте неотличим от нулевого спроса.</p>
+      </div>
+      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 40px;">
+        <div style="padding: 32px; border: 1px solid var(--rule); position: relative;">
+          <div class="micro" style="color:var(--accent);">Шаг 1</div>
+          <div class="subtitle" style="font-size:34px; color:var(--ink); margin-top: 12px; font-weight:500;">Признаки доступности</div>
+          <div class="small" style="margin-top: 14px;">is_available, hours_out_of_stock, refill_recency — из снимков остатков.</div>
+        </div>
+        <div style="padding: 32px; border: 1px solid var(--rule); position: relative;">
+          <div class="micro" style="color:var(--accent);">Шаг 2</div>
+          <div class="subtitle" style="font-size:34px; color:var(--ink); margin-top: 12px; font-weight:500;">Таргет с учётом доступности</div>
+          <div class="small" style="margin-top: 14px;">Обучение только на днях с подтверждённой доступностью. Ожидается снижение систематического занижения.</div>
+        </div>
+        <div style="padding: 32px; border: 1px solid var(--rule); position: relative;">
+          <div class="micro" style="color:var(--accent);">Шаг 3</div>
+          <div class="subtitle" style="font-size:34px; color:var(--ink); margin-top: 12px; font-weight:500;">Оптимизация загрузки</div>
+          <div class="small" style="margin-top: 14px;">От прогноза спроса к решению о загрузке: минимизация списаний и потерянных продаж.</div>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="left">Machine Learning · Professional · OTUS</div>
+      <div class="center">Доступность товара и следующие шаги</div>
+      <div class="right">17 / 17</div>
+    </div>
+  </section>
+
+</deck-stage>
+
+<!-- ─── Tweaks panel ─────────────────────────────────────────────── -->
+<div id="tweaks">
+  <h4>Tweaks</h4>
+  <div class="tweak-row">
+    <label>Accent</label>
+    <div class="swatches" id="tw-swatches">
+      <div class="sw" data-color="#0A84FF" title="iOS Blue" style="background:#0A84FF"></div>
+      <div class="sw" data-color="#1E3A8A" title="Navy" style="background:#1E3A8A"></div>
+      <div class="sw" data-color="#1F2937" title="Graphite" style="background:#1F2937"></div>
+      <div class="sw" data-color="#0F766E" title="Teal" style="background:#0F766E"></div>
+      <div class="sw" data-color="#7C2D12" title="Sienna" style="background:#7C2D12"></div>
+    </div>
+  </div>
+  <div class="tweak-row">
+    <label>Font</label>
+    <select id="tw-font">
+      <option value="Inter">Inter</option>
+      <option value="IBM Plex Sans">IBM Plex Sans</option>
+      <option value="-apple-system">System (SF Pro)</option>
+    </select>
+  </div>
+</div>
+
+<script>
+// Tweak defaults — written back to disk on edit.
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "accent": "#0F766E",
+  "font": "Inter"
+}/*EDITMODE-END*/;
+
+(function () {
+  const root = document.documentElement;
+  const accentSoft = (hex) => {
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+    return `rgba(${r},${g},${b},0.10)`;
+  };
+  const applyAccent = (hex) => {
+    root.style.setProperty('--accent', hex);
+    root.style.setProperty('--accent-soft', accentSoft(hex));
+  };
+  const applyFont = (name) => {
+    if (name === '-apple-system') {
+      root.style.setProperty('--font', '-apple-system, BlinkMacSystemFont, system-ui, sans-serif');
+    } else {
+      root.style.setProperty('--font', `'${name}', -apple-system, BlinkMacSystemFont, system-ui, sans-serif`);
+    }
+  };
+  applyAccent(TWEAK_DEFAULTS.accent);
+  applyFont(TWEAK_DEFAULTS.font);
+
+  // Tweaks wiring
+  const panel = document.getElementById('tweaks');
+  const swatches = document.getElementById('tw-swatches');
+  const fontSelect = document.getElementById('tw-font');
+
+  const markActiveSwatch = (hex) => {
+    [...swatches.querySelectorAll('.sw')].forEach(sw => {
+      if (sw.dataset.color.toLowerCase() === hex.toLowerCase()) sw.setAttribute('data-active', '');
+      else sw.removeAttribute('data-active');
+    });
+  };
+  markActiveSwatch(TWEAK_DEFAULTS.accent);
+  fontSelect.value = TWEAK_DEFAULTS.font;
+
+  swatches.addEventListener('click', (e) => {
+    const sw = e.target.closest('.sw'); if (!sw) return;
+    const hex = sw.dataset.color;
+    applyAccent(hex);
+    markActiveSwatch(hex);
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits: { accent: hex } }, '*');
+  });
+  fontSelect.addEventListener('change', (e) => {
+    const name = e.target.value;
+    applyFont(name);
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits: { font: name } }, '*');
+  });
+
+  // Edit mode protocol
+  window.addEventListener('message', (e) => {
+    const d = e.data || {};
+    if (d.type === '__activate_edit_mode') panel.classList.add('on');
+    else if (d.type === '__deactivate_edit_mode') panel.classList.remove('on');
+  });
+  window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+})();
+</script>
+
+</body>
+</html>

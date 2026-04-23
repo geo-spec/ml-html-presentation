@@ -27,7 +27,7 @@
  *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
  *     e.detail.index         // new 0-based index
  *     e.detail.previousIndex // previous index, or -1 on init
- *     e.detail.total         // total slide count
+ *     e.detail.total         // total numbered slides (title excluded)
  *     e.detail.slide         // the new active slide element
  *     e.detail.previousSlide // the prior slide element, or null on init
  *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
@@ -44,7 +44,7 @@
  *
  * Slides are the direct element children of <deck-stage>. Each slide is
  * automatically tagged with:
- *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-screen-label="NN Label"   (visible numbering: title is 00)
  *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
  */
 
@@ -200,6 +200,10 @@
       background: rgba(255,255,255,0.12);
       border-radius: 4px;
     }
+    .btn.fullscreen svg { width: 13px; height: 13px; }
+    .btn.fullscreen .icon-exit { display: none; }
+    .btn.fullscreen[data-active] .icon-enter { display: none; }
+    .btn.fullscreen[data-active] .icon-exit { display: block; }
 
     .count {
       font-variant-numeric: tabular-nums;
@@ -284,6 +288,7 @@
       this._onMouseMove = this._onMouseMove.bind(this);
       this._onTapBack = this._onTapBack.bind(this);
       this._onTapForward = this._onTapForward.bind(this);
+      this._onFullscreenChange = this._onFullscreenChange.bind(this);
     }
 
     get designWidth() {
@@ -300,6 +305,8 @@
       window.addEventListener('keydown', this._onKey);
       window.addEventListener('resize', this._onResize);
       window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      document.addEventListener('fullscreenchange', this._onFullscreenChange);
+      document.addEventListener('webkitfullscreenchange', this._onFullscreenChange);
       // Initial collection + layout happens via slotchange, which fires on mount.
     }
 
@@ -307,6 +314,8 @@
       window.removeEventListener('keydown', this._onKey);
       window.removeEventListener('resize', this._onResize);
       window.removeEventListener('mousemove', this._onMouseMove);
+      document.removeEventListener('fullscreenchange', this._onFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', this._onFullscreenChange);
       if (this._hideTimer) clearTimeout(this._hideTimer);
       if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
     }
@@ -371,11 +380,18 @@
         </button>
         <span class="divider"></span>
         <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+        <button class="btn fullscreen" type="button" aria-label="Enter fullscreen" title="Fullscreen (F)">
+          <svg class="icon-enter" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/></svg>
+          <svg class="icon-exit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4"/></svg>
+        </button>
       `;
 
       overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
       overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
       overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+      const fsBtn = overlay.querySelector('.fullscreen');
+      fsBtn.addEventListener('click', () => this._toggleFullscreen());
+      this._fsBtn = fsBtn;
 
       this._root.append(style, stage, tapzones, overlay);
       this._canvas = canvas;
@@ -419,7 +435,7 @@
       });
 
       this._slides.forEach((slide, i) => {
-        const n = i + 1;
+        const n = i;
         // Determine a label for comment flow: prefer explicit data-label,
         // then an existing data-screen-label, then first heading, else "Slide".
         let label = slide.getAttribute('data-label');
@@ -445,7 +461,7 @@
         slide.setAttribute('data-deck-slide', String(i));
       });
 
-      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._totalEl) this._totalEl.textContent = String(Math.max(0, this._slides.length - 1));
       if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
     }
 
@@ -462,6 +478,18 @@
     }
 
     _restoreIndex() {
+      // URL override: ?slide=N or #N, where 0 = title slide and 1 = first numbered slide.
+      try {
+        const params = new URLSearchParams(location.search);
+        const raw = params.get('slide') || (location.hash ? location.hash.replace(/^#/, '') : '');
+        if (raw) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n >= 0 && n < this._slides.length) {
+            this._index = n;
+            return;
+          }
+        }
+      } catch (e) { /* ignore */ }
       try {
         const raw = localStorage.getItem(this._storageKey);
         if (raw != null) {
@@ -486,7 +514,7 @@
         if (i === curr) s.setAttribute('data-deck-active', '');
         else s.removeAttribute('data-deck-active');
       });
-      if (this._countEl) this._countEl.textContent = String(curr + 1);
+      if (this._countEl) this._countEl.textContent = String(curr);
       this._persistIndex();
 
       if (broadcast) {
@@ -501,7 +529,7 @@
         const detail = {
           index: curr,
           previousIndex: prev,
-          total: this._slides.length,
+          total: Math.max(0, this._slides.length - 1),
           slide: this._slides[curr] || null,
           previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
           reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
@@ -577,9 +605,11 @@
         this._go(this._slides.length - 1, 'keyboard');
       } else if (key === 'r' || key === 'R') {
         this._go(0, 'keyboard');
+      } else if (key === 'f' || key === 'F') {
+        this._toggleFullscreen();
       } else if (/^[0-9]$/.test(key)) {
-        // 1..9 jump to that slide; 0 jumps to 10.
-        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        // Number keys match visible slide numbering: 0 = title, 1..9 = numbered slides.
+        const n = parseInt(key, 10);
         if (n < this._slides.length) this._go(n, 'keyboard');
       } else {
         handled = false;
@@ -589,6 +619,33 @@
         e.preventDefault();
         this._flashOverlay();
       }
+    }
+
+    _toggleFullscreen() {
+      const doc = document;
+      const el = doc.documentElement;
+      const isFs = doc.fullscreenElement || doc.webkitFullscreenElement;
+      try {
+        if (!isFs) {
+          const req = el.requestFullscreen || el.webkitRequestFullscreen;
+          const p = req && req.call(el);
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        } else {
+          const exit = doc.exitFullscreen || doc.webkitExitFullscreen;
+          const p = exit && exit.call(doc);
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    _onFullscreenChange() {
+      const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      if (this._fsBtn) {
+        this._fsBtn.toggleAttribute('data-active', isFs);
+        this._fsBtn.setAttribute('aria-label', isFs ? 'Exit fullscreen' : 'Enter fullscreen');
+        this._fsBtn.setAttribute('title', isFs ? 'Exit fullscreen (F)' : 'Fullscreen (F)');
+      }
+      this._flashOverlay();
     }
 
     _go(i, reason = 'api') {
@@ -604,9 +661,9 @@
 
     // Public API ------------------------------------------------------------
 
-    /** Current slide index (0-based). */
+    /** Current visible slide number / internal index. Title slide is 0. */
     get index() { return this._index; }
-    /** Total slide count. */
+    /** Actual DOM slide count, including the title slide. */
     get length() { return this._slides.length; }
     /** Programmatically navigate. */
     goTo(i) { this._go(i, 'api'); }
